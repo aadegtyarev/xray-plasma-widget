@@ -1,0 +1,131 @@
+#!/usr/bin/env python3
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+import tempfile
+
+ROOT = Path.home() / '.local/share/xray-proxy'
+PROFILES = ROOT / 'profiles'
+ACTIVE = ROOT / 'primary.json'
+XRAY = ROOT / 'xray'
+SERVICE = 'xray-proxy.service'
+NAME = re.compile(r'[A-Za-z0-9_-]{1,80}\Z')
+
+
+def run(args, timeout=15):
+    return subprocess.run(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=timeout).returncode == 0
+
+
+def digest(path):
+    return hashlib.sha256(path.read_bytes()).digest()
+
+
+def profile_paths():
+    if not PROFILES.is_dir():
+        return []
+    return sorted((p for p in PROFILES.glob('*.json') if NAME.fullmatch(p.stem) and p.is_file() and not p.is_symlink()), key=lambda p: p.stem.casefold())
+
+
+def status():
+    running = run(['systemctl', '--user', 'is-active', '--quiet', SERVICE], timeout=5)
+    active_hash = digest(ACTIVE) if ACTIVE.is_file() else None
+    profiles = []
+    selected = ''
+    for path in profile_paths():
+        if active_hash is not None and digest(path) == active_hash and not selected:
+            selected = path.stem
+        profiles.append({'id': path.stem, 'name': path.stem})
+    return {'running': running, 'selected': selected, 'profiles': profiles}
+
+
+def atomic_write(path, content):
+    fd, name = tempfile.mkstemp(prefix='.xray-widget-', dir=path.parent)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, 'wb') as output:
+            output.write(content)
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(name, path)
+    finally:
+        if os.path.exists(name):
+            os.unlink(name)
+
+
+def validate_profile(path):
+    try:
+        data = json.loads(path.read_text())
+        inbounds = data['inbounds']
+        if len(inbounds) != 1:
+            return False
+        inbound = inbounds[0]
+        if inbound.get('listen') != '127.0.0.1' or inbound.get('port') != 20172 or inbound.get('protocol') != 'http':
+            return False
+        return run([str(XRAY), 'run', '-test', '-config', str(path)], timeout=15)
+    except (ValueError, KeyError, TypeError, AttributeError, OSError):
+        return False
+
+
+def restart():
+    if not run(['systemctl', '--user', 'restart', SERVICE], timeout=25):
+        raise RuntimeError('Не удалось запустить Xray. Проверьте журнал службы xray-proxy.')
+    if not run(['systemctl', '--user', 'is-active', '--quiet', SERVICE], timeout=5):
+        raise RuntimeError('Xray не запущен. Проверьте журнал службы xray-proxy.')
+
+
+def select(profile_id):
+    if not NAME.fullmatch(profile_id):
+        raise ValueError('Некорректное имя профиля.')
+    path = PROFILES / (profile_id + '.json')
+    if path not in profile_paths() or not validate_profile(path):
+        raise ValueError('Профиль не найден или не прошёл проверку Xray и локального HTTP-порта.')
+    original = ACTIVE.read_bytes()
+    candidate = path.read_bytes()
+    if candidate == original:
+        return
+    atomic_write(ACTIVE, candidate)
+    try:
+        restart()
+    except Exception as error:
+        atomic_write(ACTIVE, original)
+        try:
+            restart()
+        except Exception:
+            raise RuntimeError('Не удалось включить профиль и восстановить службу. Проверьте журнал xray-proxy.') from error
+        raise RuntimeError('Не удалось включить профиль; прежний профиль восстановлен.') from error
+
+
+def main(args):
+    if args == ['status']:
+        return status()
+    if not ROOT.is_dir():
+        raise RuntimeError('Каталог Xray не найден.')
+    with (ROOT / '.widget.lock').open('a') as lock:
+        os.chmod(ROOT / '.widget.lock', 0o600)
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if args == ['restart']:
+            restart()
+        elif len(args) == 2 and args[0] == 'select':
+            select(args[1])
+        else:
+            raise ValueError('Неизвестная команда.')
+    return status()
+
+
+if __name__ == '__main__':
+    try:
+        print(json.dumps({'ok': True, **main(sys.argv[1:])}, ensure_ascii=False))
+    except (OSError, ValueError, RuntimeError, subprocess.TimeoutExpired) as error:
+        if isinstance(error, subprocess.TimeoutExpired):
+            message = 'Истекло время ожидания команды Xray или systemd.'
+        elif isinstance(error, OSError):
+            message = 'Ошибка доступа к файлам Xray или systemd.'
+        else:
+            message = str(error)
+        print(json.dumps({'ok': False, 'error': message}, ensure_ascii=False))
+        sys.exit(1)

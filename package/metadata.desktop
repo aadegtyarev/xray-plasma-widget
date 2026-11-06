@@ -1,0 +1,12 @@
+[Desktop Entry]
+Name=Прокси Xray
+Comment=Профиль и состояние Xray
+Icon=network-vpn
+Type=Service
+X-KDE-ServiceTypes=Plasma/Applet
+X-KDE-PluginInfo-Author=Local
+X-KDE-PluginInfo-Name=ru.adegtyarev.xray
+X-KDE-PluginInfo-Version=1.0
+X-KDE-PluginInfo-License=MIT
+X-Plasma-API=declarativeappletscript
+X-Plasma-MainScript=ui/main.qml
