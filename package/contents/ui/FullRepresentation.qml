@@ -3,6 +3,7 @@ import QtQuick.Layouts 1.15
 import org.kde.plasma.core 2.0 as PlasmaCore
 import org.kde.plasma.components 3.0 as PlasmaComponents3
 import org.kde.plasma.extras 2.0 as PlasmaExtras
+import org.kde.plasma.plasmoid 2.0
 import org.kde.kirigami 2.20 as Kirigami
 
 PlasmaExtras.Representation {
@@ -22,8 +23,13 @@ PlasmaExtras.Representation {
     property bool hintVisible: false
     property bool warningDismissed: false
 
-    implicitWidth: PlasmaCore.Units.gridUnit * 24
-    implicitHeight: PlasmaCore.Units.gridUnit * 28
+    // Size from the widget settings (contents/config/main.xml), in grid units.
+    implicitWidth: PlasmaCore.Units.gridUnit * plasmoid.configuration.popupWidth
+    implicitHeight: PlasmaCore.Units.gridUnit * plasmoid.configuration.popupHeight
+    Layout.preferredWidth: implicitWidth
+    Layout.preferredHeight: implicitHeight
+    Layout.minimumWidth: PlasmaCore.Units.gridUnit * 18
+    Layout.minimumHeight: PlasmaCore.Units.gridUnit * 16
     collapseMarginsHint: true
 
     onSlotChanged: hintVisible = false
