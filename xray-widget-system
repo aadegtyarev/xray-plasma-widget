@@ -1,0 +1,250 @@
+#!/usr/bin/env python3
+import json
+from pathlib import Path
+import re
+import socket
+import stat
+import subprocess
+import sys
+
+import profile_catalog
+import profile_sources
+import subscription_profiles
+import widget_config
+
+SYSTEMCTL = '/usr/bin/systemctl'
+PKEXEC = '/usr/bin/pkexec'
+CURL = '/usr/bin/curl'
+PING_URL = 'https://www.google.com/generate_204'
+TRACE_URL = 'https://www.cloudflare.com/cdn-cgi/trace'
+ADMIN = Path('/usr/local/libexec/xray-widget-profile-admin')
+STATE = Path('/var/lib/xray-widget-profiles/state.json')
+SUBSCRIPTIONS = subscription_profiles.Subscriptions(Path.home() / '.local/share/xray-widget/subscriptions')
+SPECIAL = {'primary': 'original'}
+SELECT = {'select': 'primary', 'select-secondary': 'secondary'}
+# Tunnel ports from /etc/xray-widget/system.toml, filled in by main().
+PORTS = {}
+PROFILE_SWITCH_ENABLED = True
+
+
+def command(args, timeout=10):
+    return subprocess.run(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=timeout).returncode
+
+
+def service_pid(service):
+    result = subprocess.run([SYSTEMCTL, '--system', 'show', service, '-p', 'MainPID', '--value'], capture_output=True, text=True, timeout=10)
+    if result.returncode or not result.stdout.strip().isdecimal():
+        raise RuntimeError('Не удалось получить состояние системной службы Xray.')
+    return int(result.stdout.strip())
+
+
+def read_state():
+    try:
+        info = STATE.lstat()
+    except FileNotFoundError:
+        return {}
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022 or info.st_size > 4096:
+        raise RuntimeError('Недопустимый файл состояния профилей Xray.')
+    try:
+        value = json.loads(STATE.read_text())
+    except (OSError, ValueError) as error:
+        raise RuntimeError('Не удалось прочитать состояние профилей Xray.') from error
+    if not isinstance(value, dict):
+        raise RuntimeError('Некорректное состояние профилей Xray.')
+    return value
+
+
+def sort_text(title):
+    # Flags and other leading symbols would otherwise order the list by country code instead of by name.
+    return re.sub(r'^\W+', '', title).casefold()
+
+
+def system_profiles(refresh=None):
+    groups, labels, config_errors = widget_config.load()
+    found, missing, errors = profile_sources.collect(groups, SUBSCRIPTIONS, refresh)
+    profiles = profile_catalog.catalog(found)
+    for item in profiles:
+        names = [alias['name'] for alias in item['aliases']]
+        item['title'] = next((labels[name] for name in names if name in labels), names[0])
+    rank = {group['name']: number for number, group in enumerate(groups)}
+    profiles.sort(key=lambda item: (rank.get(item['aliases'][0]['source'], len(rank)), sort_text(item['title'])))
+    missing.sort(key=lambda item: (rank.get(item['source'], len(rank)), sort_text(item['name'])))
+    return profiles, missing, config_errors + errors
+
+
+def selections(state, pid):
+    if not pid or state.get('pid') != pid:
+        return {}
+    slots = state.get('slots')
+    if isinstance(slots, dict):
+        return slots
+    # State written before the second proxy existed: it describes only the primary one.
+    return {'primary': state.get('selected')}
+
+
+def choice(item):
+    return {'id': item['id'], 'name': item['name'], 'title': item['title'], 'aliases': item['aliases'], 'descriptions': item['descriptions'],
+            'transport': profile_catalog.transport_name(item['outbound']), 'endpoint': profile_catalog.endpoint(item['outbound'])}
+
+
+def unavailable_choice(item):
+    return {'id': item['id'], 'name': item['name'], 'title': item['name'], 'available': False, 'transport': item['kind'],
+            'aliases': [{'id': item['id'], 'name': item['name'], 'source': item['source']}], 'descriptions': [item['reason']]}
+
+
+def listening(slot):
+    try:
+        with socket.create_connection(('127.0.0.1', PORTS[slot]['http']), timeout=0.5):
+            return True
+    except OSError:
+        return False
+
+
+def selected_primary(chosen, profiles):
+    return profile_catalog.representative(profiles, chosen.get('primary')) or 'current'
+
+
+def selected_secondary(chosen, profiles):
+    if not chosen:
+        return 'current'
+    value = chosen.get('secondary')
+    if value is None:
+        return 'none'
+    return profile_catalog.representative(profiles, value) or 'current'
+
+
+def status(service, refresh='stale'):
+    result = command([SYSTEMCTL, '--system', 'is-active', '--quiet', service])
+    if result not in (0, 3):
+        raise RuntimeError('Не удалось получить состояние системной службы Xray.')
+    pid = service_pid(service) if result == 0 else 0
+    state = read_state()
+    profiles, missing, errors = system_profiles(refresh)
+    chosen = selections(state, pid)
+    listed = [choice(item) for item in profiles] + [unavailable_choice(item) for item in missing]
+    running = result == 0
+    return {'running': running, 'selected': selected_primary(chosen, profiles), 'profiles': listed,
+            'enabled': running and listening('primary'), 'ports': PORTS['primary'],
+            'secondary': {'selected': selected_secondary(chosen, profiles), 'profiles': listed,
+                          'enabled': running and listening('secondary'), 'ports': PORTS['secondary']},
+            'warning': ' '.join(dict.fromkeys(errors))}
+
+
+def load_outbound(profile_id):
+    profiles, _, _ = system_profiles()
+    for item in profiles:
+        if item['id'] == profile_id:
+            return item['outbound']
+    raise ValueError('Профиль не найден; обновите список.')
+
+
+def select_profile(slot, profile_id):
+    if profile_id == 'current':
+        return
+    if not PROFILE_SWITCH_ENABLED:
+        raise RuntimeError('Смена профиля временно отключена: проверяем маршрут Xray в обход WireGuard.')
+    request = {'action': 'select', 'slot': slot, 'id': profile_id}
+    if profile_id != SPECIAL.get(slot):
+        request['outbound'] = load_outbound(profile_id)
+    run_admin(request)
+
+
+def run_admin(request):
+    try:
+        info = ADMIN.lstat()
+    except FileNotFoundError:
+        raise RuntimeError('Системный помощник переключения профилей не установлен.') from None
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:
+        raise RuntimeError('Недопустимые права системного помощника профилей.')
+    result = subprocess.run([PKEXEC, str(ADMIN)], input=json.dumps(request), text=True, capture_output=True, timeout=180)
+    try:
+        response = json.loads(result.stdout)
+    except (ValueError, TypeError):
+        raise RuntimeError('Переключение отменено или не получено подтверждение администратора.') from None
+    if result.returncode or not isinstance(response, dict) or not response.get('ok'):
+        message = response.get('error') if isinstance(response, dict) else None
+        raise RuntimeError(message or 'Не удалось переключить профиль Xray.')
+
+
+def confirmed(view, profile_id):
+    selected = view['selected']
+    return selected == profile_id or any(item.get('id') == selected and any(alias.get('id') == profile_id for alias in item.get('aliases', []))
+                                         for item in view.get('profiles', []))
+
+
+def select(service, slot, profile_id):
+    select_profile(slot, profile_id)
+    state = status(service)
+    if profile_id != 'current':
+        if not confirmed(state if slot == 'primary' else state['secondary'], profile_id):
+            raise RuntimeError('Состояние выбранного профиля не подтверждено. Проверьте службу Xray.')
+        state['https_checked'] = True
+    return state
+
+
+def set_enabled(service, slot, enabled):
+    if not PROFILE_SWITCH_ENABLED:
+        raise RuntimeError('Смена профиля временно отключена: проверяем маршрут Xray в обход WireGuard.')
+    run_admin({'action': 'enable', 'slot': slot, 'enabled': enabled})
+    state = status(service)
+    view = state if slot == 'primary' else state['secondary']
+    if view['enabled'] != enabled:
+        raise RuntimeError('Состояние прокси не подтверждено. Проверьте службу Xray.')
+    state['https_checked'] = enabled
+    return state
+
+
+def ping(slot):
+    proxy = 'http://127.0.0.1:' + str(PORTS[slot]['http'])
+    result = subprocess.run([CURL, '--noproxy', '', '--silent', '--proxy', proxy, '--connect-timeout', '5', '--max-time', '10',
+                             '--write-out', '\n@%{http_code} %{time_total}\n', '--output', '/dev/null', PING_URL, TRACE_URL],
+                            capture_output=True, text=True, timeout=25)
+    lines = result.stdout.splitlines()
+    marks = [line[1:].split(' ') for line in lines if line.startswith('@')]
+    if not marks or marks[0][0] != '204':
+        return {'slot': slot, 'ok': False}
+    answer = {'slot': slot, 'ok': True, 'ms': round(float(marks[0][1]) * 1000)}
+    trace = dict(line.split('=', 1) for line in lines if '=' in line and not line.startswith('@'))
+    if len(marks) > 1 and marks[1][0] == '200' and re.fullmatch(r'[0-9a-fA-F.:]{3,45}', trace.get('ip', '')):
+        answer['ip'] = trace['ip']
+        if re.fullmatch(r'[A-Z]{2}', trace.get('loc', '')):
+            answer['country'] = trace['loc']
+    return answer
+
+
+def main(action):
+    service, ports = widget_config.load_system()
+    PORTS.clear()
+    PORTS.update(ports)
+    if action == ['status']:
+        return status(service)
+    if len(action) == 2 and action[0] in SELECT:
+        return select(service, SELECT[action[0]], action[1])
+    if len(action) == 3 and action[0] == 'enable' and action[1] in PORTS and action[2] in ('on', 'off'):
+        return set_enabled(service, action[1], action[2] == 'on')
+    if len(action) == 2 and action[0] == 'ping' and action[1] in PORTS:
+        return {**status(service), 'ping': ping(action[1])}
+    if action == ['refresh']:
+        return status(service, 'force')
+    if action != ['restart']:
+        raise ValueError('Неизвестная команда.')
+    if command([PKEXEC, SYSTEMCTL, 'restart', service], timeout=120) != 0:
+        raise RuntimeError('Не удалось запустить Xray: доступ не предоставлен или служба завершилась с ошибкой.')
+    state = status(service)
+    if not state['running']:
+        raise RuntimeError('Служба Xray не запущена. Проверьте её журнал.')
+    return state
+
+
+if __name__ == '__main__':
+    try:
+        print(json.dumps({'ok': True, **main(sys.argv[1:])}, ensure_ascii=False))
+    except (OSError, ValueError, RuntimeError, subprocess.TimeoutExpired) as error:
+        if isinstance(error, subprocess.TimeoutExpired):
+            message = 'Истекло время ожидания системной службы Xray.'
+        elif isinstance(error, OSError):
+            message = 'Ошибка запуска systemctl или запроса прав администратора.'
+        else:
+            message = str(error)
+        print(json.dumps({'ok': False, 'error': message}, ensure_ascii=False))
+        sys.exit(1)

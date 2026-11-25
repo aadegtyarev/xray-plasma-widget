@@ -1,0 +1,112 @@
+#!/usr/bin/env python3
+"""Переносит профили Throne или Nekoray в папку профилей виджета: каждый профиль становится файлом с outbound Xray.
+
+Использование: import-throne ПАПКА_ПРОФИЛЕЙ_THRONE [ПАПКА_ВИДЖЕТА]
+По умолчанию профили пишутся в ~/.config/xray-widget/profiles. Существующие файлы не перезаписываются,
+профили с уже имеющимися настройками пропускаются. Ключи и пароли на экран не выводятся.
+"""
+import json
+import os
+from pathlib import Path
+import sys
+
+import adpc_profiles
+import vless_profiles
+
+TARGET = Path.home() / '.config/xray-widget/profiles'
+
+
+def settings(data):
+    # Newer Throne keeps the real settings in "outbound" and may leave an empty "bean" behind; older versions have only "bean".
+    if isinstance(data.get('outbound'), dict):
+        return 'outbound', data['outbound']
+    return 'bean', data.get('bean')
+
+
+def convert(data, directory):
+    kind = data.get('type')
+    form, _ = settings(data)
+    if form == 'outbound' and kind == 'vless':
+        return vless_profiles.convert_profile(data)
+    if form == 'bean' and kind == 'wireguard':
+        return adpc_profiles.wireguard_outbound(data['bean'])
+    if form == 'bean' and kind == 'vless':
+        _, stream = adpc_profiles.normalize_bean(data)
+        saved = adpc_profiles.read_json_file(directory / 'xhttp-primary-outbound.json') if stream.get('net') == 'xhttp' else None
+        return adpc_profiles.convert_profile_from_adpc(data, saved)
+    raise ValueError('тип профиля ' + str(kind) + ' не поддерживается')
+
+
+def key(outbound):
+    return json.dumps({k: v for k, v in outbound.items() if k != 'tag'}, sort_keys=True)
+
+
+def free_name(target, name):
+    base = ' '.join(name.replace('/', '-').split())[:100].lstrip('.') or 'Профиль'
+    candidate, number = base, 2
+    while (target / (candidate + '.json')).exists():
+        candidate = base + ' (' + str(number) + ')'
+        number += 1
+    return candidate + '.json'
+
+
+def write_private(path, data):
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, 'w') as file:
+        file.write(json.dumps(data, ensure_ascii=False, indent=2) + '\n')
+
+
+def import_folder(source, target=TARGET):
+    source, target = Path(source).expanduser(), Path(target).expanduser()
+    if not source.is_dir():
+        raise ValueError('Папка ' + str(source) + ' не найдена.')
+    target.mkdir(mode=0o700, parents=True, exist_ok=True)
+    known = set()
+    for path in target.glob('*.json'):
+        try:
+            known.add(key(adpc_profiles.read_json_file(path)))
+        except ValueError:
+            pass
+    report = []
+    paths = [path for path in source.glob('*.json') if path.stem.isdecimal() and len(path.stem) <= 6]
+    for path in sorted(paths, key=lambda item: int(item.stem)):
+        name = 'Профиль ' + path.stem
+        try:
+            data = adpc_profiles.read_json_file(path)
+            if not isinstance(data, dict):
+                raise ValueError('файл повреждён')
+            _, fields = settings(data)
+            if isinstance(fields, dict) and isinstance(fields.get('name'), str) and fields['name'].strip():
+                name = ' '.join(fields['name'].split())
+            outbound = convert(data, source)
+        except (ValueError, KeyError, TypeError, AttributeError) as error:
+            report.append(('-', name, str(error) if isinstance(error, ValueError) else 'файл повреждён'))
+            continue
+        outbound.pop('tag', None)
+        if key(outbound) in known:
+            report.append(('=', name, 'такой профиль уже есть'))
+            continue
+        file_name = free_name(target, name)
+        write_private(target / file_name, outbound)
+        known.add(key(outbound))
+        report.append(('+', name, file_name))
+    return report
+
+
+def main(args):
+    if not 1 <= len(args) <= 2 or args[0] in ('-h', '--help'):
+        print(__doc__.strip())
+        return 0 if args[:1] in (['-h'], ['--help']) else 2
+    try:
+        report = import_folder(*args)
+    except (OSError, ValueError) as error:
+        print('Ошибка: ' + str(error), file=sys.stderr)
+        return 1
+    for mark, name, note in report:
+        print(mark, name, '→' if mark == '+' else '—', note)
+    print('Перенесено: ' + str(sum(mark == '+' for mark, _, _ in report)) + ' из ' + str(len(report)) + '.')
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv[1:]))

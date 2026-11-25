@@ -1,0 +1,628 @@
+#!/usr/bin/env python3
+import copy
+import fcntl
+import hashlib
+import ipaddress
+import json
+import os
+from pathlib import Path
+import re
+import signal
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+import tomllib
+import uuid
+
+# Service, config, Xray binary, ports and route mark come from SETTINGS (see load_settings); these are the defaults.
+SETTINGS = Path('/etc/xray-widget/system.toml')
+CONFIG = Path('/usr/local/etc/xray/config.json')
+BASELINE = CONFIG.with_name('widget-baseline.json')
+STATE_DIR = Path('/var/lib/xray-widget-profiles')
+STATE = STATE_DIR / 'state.json'
+LOCK = Path('/run/lock/xray-widget-profiles.lock')
+XRAY = '/usr/local/bin/xray'
+SYSTEMCTL = '/usr/bin/systemctl'
+CURL = '/usr/bin/curl'
+SERVICE = 'xray.service'
+SERVICE_NAME = re.compile(r'[A-Za-z0-9_][A-Za-z0-9_.@:-]*\.service\Z')
+MAX_CONFIG = 4 * 1024 * 1024
+ROUTE_MARK = None
+PROFILE_ID = re.compile(r'p-[0-9a-f]{12}')
+LISTENERS = ('socks', 'http')
+SLOTS = {
+    'primary': {'outbound': 'proxy-primary', 'suffix': '', 'title': 'основного прокси', 'socks': 10808, 'http': 10809},
+    'secondary': {'outbound': 'proxy-secondary', 'suffix': '-secondary', 'title': 'второго прокси', 'socks': 10818, 'http': 10819},
+}
+PROTOCOLS = ('vless', 'wireguard')
+WG_KEY = re.compile(r'[A-Za-z0-9+/]{43}=\Z')
+OPEN_ROUTES = ['0.0.0.0/0', '::/0']
+
+
+def run(args, timeout):
+    return subprocess.run(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=timeout).returncode == 0
+
+
+def read_regular(path, maximum=MAX_CONFIG):
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    with os.fdopen(fd, 'rb') as f:
+        info = os.fstat(f.fileno())
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022 or info.st_size > maximum:
+            raise ValueError('Недопустимый системный файл конфигурации.')
+        data = f.read(maximum + 1)
+        if len(data) > maximum:
+            raise ValueError('Системный файл конфигурации слишком велик.')
+        return data
+
+
+def atomic_write(path, data, mode, gid=0):
+    fd, name = tempfile.mkstemp(prefix='.xray-widget-', dir=path.parent)
+    try:
+        os.fchmod(fd, mode)
+        os.fchown(fd, 0, gid)
+        with os.fdopen(fd, 'wb') as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(name, path)
+    finally:
+        if os.path.exists(name):
+            os.unlink(name)
+
+
+def exact_keys(value, keys):
+    if not isinstance(value, dict) or set(value) != set(keys):
+        raise ValueError('Недопустимая структура профиля.')
+
+
+def check_text(value, maximum, allow_empty=False):
+    if not isinstance(value, str) or len(value) > maximum or (not allow_empty and not value) or any(ord(c) < 33 or ord(c) > 126 for c in value):
+        raise ValueError('Недопустимые параметры профиля.')
+
+
+def check_number(value, low, high, message):
+    if type(value) is not int or not low <= value <= high:
+        raise ValueError(message)
+
+
+def validate_outbound(outbound):
+    if not isinstance(outbound, dict) or outbound.get('tag') != 'proxy-primary':
+        raise ValueError('Недопустимая структура профиля.')
+    if outbound.get('protocol') == 'wireguard':
+        return validate_wireguard(outbound)
+    return validate_vless(outbound)
+
+
+def validate_wireguard(outbound):
+    exact_keys(outbound, ('tag', 'protocol', 'settings', 'streamSettings'))
+    if outbound['streamSettings'] != {}:
+        raise ValueError('Параметры транспорта WireGuard не поддерживаются.')
+    settings = outbound['settings']
+    exact_keys(settings, ('secretKey', 'address', 'peers', 'mtu', 'noKernelTun', 'domainStrategy'))
+    # A kernel interface would add routes outside the guarded mark; the userspace stack keeps all packets inside Xray.
+    if settings['noKernelTun'] is not True:
+        raise ValueError('WireGuard должен работать без системного интерфейса.')
+    if settings['domainStrategy'] not in ('ForceIP', 'ForceIPv4', 'ForceIPv6'):
+        raise ValueError('Недопустимая стратегия адресов WireGuard.')
+    check_number(settings['mtu'], 576, 1500, 'Недопустимый MTU WireGuard.')
+    addresses = settings['address']
+    if not isinstance(addresses, list) or not 1 <= len(addresses) <= 4:
+        raise ValueError('Недопустимые адреса WireGuard.')
+    for address in addresses:
+        check_text(address, 64)
+        ipaddress.ip_interface(address)
+    peers = settings['peers']
+    if not isinstance(peers, list) or len(peers) != 1:
+        raise ValueError('Ожидается один узел WireGuard.')
+    peer = peers[0]
+    keys = ('endpoint', 'publicKey', 'keepAlive', 'allowedIPs')
+    exact_keys(peer, keys + ('preSharedKey',) if isinstance(peer, dict) and 'preSharedKey' in peer else keys)
+    for key in (settings['secretKey'], peer['publicKey'], peer.get('preSharedKey', 'A' * 43 + '=')):
+        if not isinstance(key, str) or not WG_KEY.fullmatch(key):
+            raise ValueError('Недопустимый ключ WireGuard.')
+    check_text(peer['endpoint'], 260)
+    host, _, port = peer['endpoint'].rpartition(':')
+    if not host or not port.isdecimal():
+        raise ValueError('Недопустимый адрес узла WireGuard.')
+    check_number(int(port), 1, 65535, 'Недопустимый порт узла WireGuard.')
+    check_number(peer['keepAlive'], 0, 65535, 'Недопустимый интервал keepalive WireGuard.')
+    if peer['allowedIPs'] != OPEN_ROUTES:
+        raise ValueError('Недопустимые маршруты WireGuard.')
+
+
+def validate_vless(outbound):
+    keys = ('tag', 'protocol', 'settings', 'streamSettings', 'mux') if 'mux' in outbound else ('tag', 'protocol', 'settings', 'streamSettings')
+    exact_keys(outbound, keys)
+    if 'mux' in outbound:
+        mux = outbound['mux']
+        exact_keys(mux, ('enabled', 'concurrency', 'xudpConcurrency'))
+        if mux != {'enabled': True, 'concurrency': -1, 'xudpConcurrency': 8}:
+            raise ValueError('Параметры XUDP не поддерживаются.')
+    if outbound['tag'] != 'proxy-primary' or outbound['protocol'] != 'vless':
+        raise ValueError('Ожидается исходящее соединение VLESS.')
+    settings = outbound['settings']
+    exact_keys(settings, ('vnext',))
+    vnext = settings['vnext']
+    if not isinstance(vnext, list) or len(vnext) != 1:
+        raise ValueError('Ожидается один сервер VLESS.')
+    server = vnext[0]
+    exact_keys(server, ('address', 'port', 'users'))
+    check_text(server['address'], 253)
+    if type(server['port']) is not int or not 1 <= server['port'] <= 65535:
+        raise ValueError('Недопустимый порт профиля.')
+    users = server['users']
+    if not isinstance(users, list) or len(users) != 1:
+        raise ValueError('Ожидается один пользователь VLESS.')
+    user = users[0]
+    exact_keys(user, ('id', 'encryption', 'flow'))
+    try:
+        uuid.UUID(user['id'])
+    except (ValueError, TypeError, AttributeError):
+        raise ValueError('Недопустимый UUID профиля.') from None
+    if user['encryption'] != 'none' or user['flow'] not in ('', 'xtls-rprx-vision'):
+        raise ValueError('Параметры VLESS не поддерживаются.')
+    stream = outbound['streamSettings']
+    if not isinstance(stream, dict):
+        raise ValueError('Недопустимая структура транспорта.')
+    network, security = stream.get('network'), stream.get('security')
+    fingerprints = ('random', 'chrome', 'firefox', 'safari', 'ios', 'android', 'edge', '360', 'qq', 'randomized')
+    if network == 'tcp' and security == 'reality':
+        exact_keys(stream, ('network', 'security', 'realitySettings'))
+        reality = stream['realitySettings']
+        exact_keys(reality, ('serverName', 'fingerprint', 'password', 'shortId'))
+        check_text(reality['serverName'], 253)
+        check_text(reality['password'], 128)
+        check_text(reality['shortId'], 16, allow_empty=True)
+        if reality['fingerprint'] not in fingerprints:
+            raise ValueError('Отпечаток TLS не поддерживается.')
+        return
+    if network not in ('ws', 'xhttp') or security != 'tls':
+        raise ValueError('Транспорт VLESS не поддерживается.')
+    field = 'wsSettings' if network == 'ws' else 'xhttpSettings'
+    exact_keys(stream, ('network', 'security', 'tlsSettings', field))
+    tls = stream['tlsSettings']
+    if not isinstance(tls, dict) or not {'serverName', 'fingerprint', 'allowInsecure'} <= set(tls) or set(tls) - {'serverName', 'fingerprint', 'allowInsecure', 'alpn'}:
+        raise ValueError('Недопустимые настройки TLS.')
+    check_text(tls['serverName'], 253)
+    if tls['fingerprint'] not in fingerprints or tls['allowInsecure'] is not False:
+        raise ValueError('Параметры TLS не поддерживаются.')
+    if 'alpn' in tls:
+        if not isinstance(tls['alpn'], list) or not 1 <= len(tls['alpn']) <= 8:
+            raise ValueError('Недопустимый список ALPN.')
+        for item in tls['alpn']:
+            check_text(item, 64)
+    settings = stream[field]
+    if not isinstance(settings, dict):
+        raise ValueError('Недопустимые настройки транспорта.')
+    if network == 'ws':
+        if 'path' not in settings or set(settings) - {'path', 'host'}:
+            raise ValueError('Недопустимые настройки WebSocket.')
+    else:
+        exact_keys(settings, ('path', 'host', 'mode'))
+        if settings['mode'] not in ('auto', 'packet-up', 'stream-one', 'stream-up'):
+            raise ValueError('Режим XHTTP не поддерживается.')
+    check_text(settings['path'], 2048)
+    if 'host' in settings:
+        check_text(settings['host'], 253)
+
+
+def listeners(slot):
+    return [(protocol, '127.0.0.1', SLOTS[slot][protocol]) for protocol in LISTENERS]
+
+
+def listener(inbound):
+    return (inbound.get('protocol'), inbound.get('listen'), inbound.get('port'))
+
+
+def inbound(slot, protocol):
+    item = {'tag': protocol + SLOTS[slot]['suffix'], 'listen': '127.0.0.1', 'port': SLOTS[slot][protocol], 'protocol': protocol, 'settings': {}}
+    if protocol == 'socks':
+        item['settings'] = {'auth': 'noauth', 'udp': True}
+        item['sniffing'] = {'enabled': True, 'destOverride': ['http', 'tls'], 'routeOnly': True}
+    return item
+
+
+def secondary_rule():
+    return {'type': 'field', 'inboundTag': [protocol + SLOTS['secondary']['suffix'] for protocol in LISTENERS], 'outboundTag': SLOTS['secondary']['outbound']}
+
+
+def outbound_index(config, slot):
+    matches = [i for i, item in enumerate(config['outbounds']) if item.get('tag') == SLOTS[slot]['outbound']]
+    if len(matches) != 1 or config['outbounds'][matches[0]].get('protocol') not in PROTOCOLS:
+        raise ValueError('Профиль ' + SLOTS[slot]['title'] + ' не найден.')
+    outbound = config['outbounds'][matches[0]]
+    if set(outbound) - {'tag', 'protocol', 'settings', 'streamSettings', 'mux'}:
+        raise ValueError('Дополнительные параметры маршрута Xray требуют проверки.')
+    route_mark(outbound)
+    return matches[0]
+
+
+def route_mark(outbound):
+    sockopt = outbound.get('streamSettings', {}).get('sockopt')
+    if ROUTE_MARK is None:
+        # Without a configured mark the tunnels simply share whatever socket options the primary outbound has.
+        return sockopt if isinstance(sockopt, dict) else None
+    if not isinstance(sockopt, dict) or type(sockopt.get('mark')) is not int or sockopt['mark'] != ROUTE_MARK:
+        raise ValueError('Защитная метка маршрута Xray отсутствует; переключение отменено.')
+    return sockopt
+
+
+def check_layout(config):
+    routing = config['routing']
+    if routing.get('balancers') or config.get('observatory') or config.get('burstObservatory'):
+        raise ValueError('Конфигурация с балансировкой требует отдельной проверки.')
+    rules = routing['rules']
+    if not rules or rules[-1].get('outboundTag') != SLOTS['primary']['outbound'] or rules[-1].get('network') != 'tcp,udp':
+        raise ValueError('Маршрутизация службы изменилась; переключение отменено.')
+    outbound_index(config, 'primary')
+    present = sorted(listener(item) for item in config['inbounds'])
+    enabled = {slot: [item for item in present if item in listeners(slot)] for slot in SLOTS}
+    if any(own and own != sorted(listeners(slot)) for slot, own in enabled.items()) or len(present) != sum(map(len, enabled.values())):
+        raise ValueError('Входы службы Xray изменились; переключение отменено.')
+    layout = {slot: bool(own) for slot, own in enabled.items()}
+    if any(item.get('tag') == SLOTS['secondary']['outbound'] for item in config['outbounds']):
+        outbound_index(config, 'secondary')
+        tags = sorted(item.get('tag') for item in config['inbounds'] if listener(item) in listeners('secondary'))
+        routed = [rule for rule in rules if rule.get('outboundTag') == SLOTS['secondary']['outbound']]
+        if (layout['secondary'] and tags != sorted(secondary_rule()['inboundTag'])) or len(rules) < 2 or rules[-2] != secondary_rule() or len(routed) != 1:
+            raise ValueError('Маршрутизация второго прокси изменилась; переключение отменено.')
+    elif layout['secondary']:
+        raise ValueError('Входы второго прокси не связаны с профилем; переключение отменено.')
+    else:
+        layout['secondary'] = None
+    return layout
+
+
+def load_config(data):
+    try:
+        config = json.loads(data)
+        return config, check_layout(config)
+    except (KeyError, TypeError, AttributeError, json.JSONDecodeError) as error:
+        raise ValueError('Некорректная конфигурация системной службы Xray.') from error
+
+
+def dump_config(config):
+    return (json.dumps(config, ensure_ascii=False, indent=2) + '\n').encode()
+
+
+def first_enabled(data):
+    _, layout = load_config(data)
+    return next((slot for slot in SLOTS if layout[slot]), None)
+
+
+def with_profile(data, slot, outbound):
+    validate_outbound(outbound)
+    config, layout = load_config(data)
+    replacement = copy.deepcopy(outbound)
+    replacement['tag'] = SLOTS[slot]['outbound']
+    sockopt = route_mark(config['outbounds'][outbound_index(config, 'primary')])
+    if sockopt is not None:
+        replacement['streamSettings']['sockopt'] = copy.deepcopy(sockopt)
+    if layout[slot] is None:
+        config['outbounds'].insert(outbound_index(config, 'primary') + 1, replacement)
+        rules = config['routing']['rules']
+        rules.insert(len(rules) - 1, secondary_rule())
+    else:
+        config['outbounds'][outbound_index(config, slot)] = replacement
+    return dump_config(config)
+
+
+def with_enabled(data, slot, enabled):
+    config, layout = load_config(data)
+    if layout[slot] is None:
+        raise ValueError('Сначала выберите профиль ' + SLOTS[slot]['title'] + '.')
+    if layout[slot] == enabled:
+        return data
+    if enabled:
+        config['inbounds'].extend(inbound(slot, protocol) for protocol in LISTENERS)
+    else:
+        config['inbounds'] = [item for item in config['inbounds'] if listener(item) not in listeners(slot)]
+    return dump_config(config)
+
+
+def with_original_primary(data, baseline):
+    config, _ = load_config(data)
+    original, _ = load_config(baseline)
+    config['outbounds'][outbound_index(config, 'primary')] = original['outbounds'][outbound_index(original, 'primary')]
+    return dump_config(config)
+
+
+def candidate(old, request):
+    slot = request['slot']
+    if not isinstance(slot, str) or slot not in SLOTS:
+        raise ValueError('Некорректный запрос профиля.')
+    if request['action'] == 'enable':
+        if type(request['enabled']) is not bool:
+            raise ValueError('Некорректный запрос профиля.')
+        return with_enabled(old, slot, request['enabled']), slot if request['enabled'] else None
+    profile_id = request['id']
+    if not isinstance(profile_id, str):
+        raise ValueError('Некорректный запрос профиля.')
+    if profile_id == 'original' and slot == 'primary':
+        chosen = with_original_primary(old, read_regular(BASELINE))
+    elif PROFILE_ID.fullmatch(profile_id):
+        chosen = with_profile(old, slot, request['outbound'])
+    else:
+        raise ValueError('Недопустимый идентификатор профиля.')
+    return with_enabled(chosen, slot, True), slot
+
+
+def ensure_config_dir():
+    info = CONFIG.parent.lstat()
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:
+        raise ValueError('Недопустимые права каталога конфигурации Xray.')
+
+
+def ensure_state_dir():
+    STATE_DIR.mkdir(mode=0o755, exist_ok=True)
+    info = STATE_DIR.lstat()
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:
+        raise ValueError('Недопустимые права каталога состояния.')
+
+
+def service_pid():
+    result = subprocess.run([SYSTEMCTL, 'show', SERVICE, '-p', 'MainPID', '--value'], capture_output=True, text=True, timeout=10)
+    if result.returncode or not result.stdout.strip().isdecimal() or int(result.stdout.strip()) == 0:
+        raise RuntimeError('Служба Xray не запущена.')
+    return int(result.stdout.strip())
+
+
+def restart_and_check(slot):
+    if not run([SYSTEMCTL, 'restart', SERVICE], 30):
+        raise RuntimeError('Не удалось перезапустить системную службу Xray.')
+    time.sleep(1)
+    if not run([SYSTEMCTL, 'is-active', '--quiet', SERVICE], 10):
+        raise RuntimeError('Служба Xray остановилась после запуска.')
+    proxy = 'http://127.0.0.1:' + str(SLOTS[slot]['http']) if slot else None
+    if proxy and not run([CURL, '--noproxy', '', '--silent', '--fail', '--output', '/dev/null', '--proxy', proxy, '--connect-timeout', '8', '--max-time', '15', 'https://example.com/'], 20):
+        raise RuntimeError('Профиль не прошёл проверку HTTPS через прокси.')
+    return service_pid()
+
+
+def config_error(output):
+    text = output.lower()
+    known = (
+        ('permission denied', 'недостаточно прав на необходимый файл'),
+        ('no such file or directory', 'не найден необходимый файл Xray'),
+        ('failed to get format', 'не распознан формат конфигурации'),
+        ('address already in use', 'нужный локальный порт уже занят'),
+    )
+    return next((message for fragment, message in known if fragment in text), 'подробности доступны при отдельной проверке конфигурации')
+
+
+def validate_config(data):
+    gid = config_group()
+    fd, name = tempfile.mkstemp(prefix='.xray-widget-test-', suffix='.json', dir=CONFIG.parent)
+    try:
+        os.fchmod(fd, 0o640)
+        os.fchown(fd, 0, gid)
+        with os.fdopen(fd, 'wb') as f:
+            f.write(data)
+        result = subprocess.run([XRAY, 'run', '-test', '-config', name], capture_output=True, text=True, timeout=15)
+        if result.returncode:
+            raise ValueError('Конфигурация не прошла проверку Xray: ' + config_error(result.stdout + '\n' + result.stderr) + '.')
+    finally:
+        if os.path.exists(name):
+            os.unlink(name)
+
+
+def carried_selections(config):
+    try:
+        state = json.loads(read_regular(STATE, 4096))
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(state, dict) or state.get('config_sha256') != hashlib.sha256(config).hexdigest():
+        return {}
+    slots = state.get('slots')
+    if not isinstance(slots, dict):
+        slots = {'primary': state.get('selected')}
+    return {slot: value for slot, value in slots.items() if slot in SLOTS and isinstance(value, str)}
+
+
+def write_state(selections, pid, config):
+    state = {'slots': selections, 'pid': pid, 'config_sha256': hashlib.sha256(config).hexdigest(), 'baseline': BASELINE.exists()}
+    atomic_write(STATE, (json.dumps(state) + '\n').encode(), 0o644)
+
+
+def save_baseline(old):
+    try:
+        fd = os.open(BASELINE, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o640)
+    except FileExistsError:
+        read_regular(BASELINE)
+        return False
+    try:
+        with os.fdopen(fd, 'wb') as f:
+            os.fchown(f.fileno(), 0, config_group())
+            f.write(old)
+            f.flush()
+            os.fsync(f.fileno())
+    except BaseException:
+        BASELINE.unlink(missing_ok=True)
+        raise
+    return True
+
+
+def failure_reason(error):
+    if isinstance(error, (ValueError, RuntimeError, PermissionError)):
+        return str(error)
+    if isinstance(error, subprocess.TimeoutExpired):
+        return 'Истекло время ожидания проверки.'
+    if isinstance(error, KeyboardInterrupt):
+        return 'Переключение прервано.'
+    return 'Не удалось завершить переключение профиля.'
+
+
+def apply(request):
+    ensure_config_dir()
+    old = read_regular(CONFIG)
+    new, checked_slot = candidate(old, request)
+    validate_config(new)
+    ensure_state_dir()
+    selections = carried_selections(old)
+    if request['action'] == 'select':
+        selections[request['slot']] = request['id']
+    if read_regular(CONFIG) != old:
+        raise RuntimeError('Конфигурация изменилась во время проверки; переключение отменено.')
+    created_baseline = save_baseline(old) if request.get('id') != 'original' else False
+    if read_regular(CONFIG) != old:
+        if created_baseline:
+            BASELINE.unlink()
+        raise RuntimeError('Конфигурация изменилась во время проверки; переключение отменено.')
+    gid = config_group()
+    atomic_write(CONFIG, new, 0o640, gid)
+    try:
+        pid = restart_and_check(checked_slot)
+        if read_regular(CONFIG) != new:
+            raise RuntimeError('Конфигурация изменилась во время запуска; проверьте службу Xray.')
+        write_state(selections, pid, new)
+    except BaseException as error:
+        try:
+            if read_regular(CONFIG) != new:
+                raise RuntimeError('Конфигурация изменилась извне; автоматический откат отменён. Проверьте службу Xray.')
+        except RuntimeError:
+            raise
+        except BaseException:
+            raise RuntimeError('Не удалось проверить конфигурацию перед откатом. Проверьте службу Xray.') from error
+        try:
+            atomic_write(CONFIG, old, 0o640, gid)
+        except BaseException:
+            raise RuntimeError('Не удалось вернуть прежнюю конфигурацию. Проверьте службу Xray.') from error
+        try:
+            restart_and_check(first_enabled(old))
+        except BaseException:
+            raise RuntimeError('Прежняя конфигурация возвращена, но работа прокси не подтвердилась. Проверьте службу Xray.') from error
+        raise RuntimeError(failure_reason(error) + ' Прежняя конфигурация восстановлена.') from error
+
+
+def check(request):
+    ensure_config_dir()
+    current = read_regular(CONFIG)
+    validate_config(with_profile(current, 'primary', request.get('outbound')))
+
+
+def check_many(request):
+    entries = request.get('profiles')
+    if not isinstance(entries, list) or not 1 <= len(entries) <= 32:
+        raise ValueError('Некорректный список профилей для проверки.')
+    ensure_config_dir()
+    current = read_regular(CONFIG)
+    results, seen = [], set()
+    for item in entries:
+        exact_keys(item, ('id', 'outbound'))
+        ident = item['id']
+        if not isinstance(ident, str) or not PROFILE_ID.fullmatch(ident) or ident in seen:
+            raise ValueError('Некорректный идентификатор профиля для проверки.')
+        seen.add(ident)
+        try:
+            validate_config(with_profile(current, 'primary', item['outbound']))
+            results.append({'id': ident, 'ok': True})
+        except ValueError as error:
+            results.append({'id': ident, 'ok': False, 'error': str(error)})
+        except (OSError, subprocess.TimeoutExpired):
+            results.append({'id': ident, 'ok': False, 'error': 'Проверка Xray не завершена.'})
+    return {'checks': results}
+
+
+def trusted_file(value, what):
+    if not isinstance(value, str) or not value.startswith('/') or '\0' in value or '/../' in value + '/':
+        raise ValueError('В настройках неверный путь: ' + what + '.')
+    return Path(value)
+
+
+def load_settings(path=SETTINGS):
+    global CONFIG, BASELINE, XRAY, SERVICE, ROUTE_MARK
+    try:
+        data = tomllib.loads(read_regular(path, 64 * 1024).decode())
+    except FileNotFoundError:
+        raise ValueError('Нет файла настроек ' + str(path) + '; образец — system.example.toml.') from None
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError):
+        raise ValueError('Файл настроек ' + str(path) + ' не прочитан.') from None
+    required = {'service', 'config', 'xray', 'ports'}
+    if not required <= set(data) or set(data) - required - {'route_mark'}:
+        raise ValueError('В ' + str(path) + ' нужны service, config, xray, ports и, если нужна, route_mark.')
+    if not isinstance(data['service'], str) or not SERVICE_NAME.fullmatch(data['service']):
+        raise ValueError('В настройках неверное имя службы.')
+    config, xray = trusted_file(data['config'], 'config'), trusted_file(data['xray'], 'xray')
+    try:
+        info = xray.stat()
+    except OSError:
+        raise ValueError('Xray не найден: ' + str(xray) + '.') from None
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:
+        raise ValueError('Файл Xray должен принадлежать root и не быть доступным на запись другим.')
+    mark = data.get('route_mark')
+    if mark is not None and (type(mark) is not int or not 1 <= mark <= 0xFFFFFFFF):
+        raise ValueError('В настройках неверная метка route_mark.')
+    ports = data['ports']
+    if not isinstance(ports, dict) or set(ports) != set(SLOTS):
+        raise ValueError('В настройках ports нужны primary и secondary.')
+    numbers = []
+    for slot in SLOTS:
+        if not isinstance(ports[slot], dict) or set(ports[slot]) != set(LISTENERS):
+            raise ValueError('В настройках ports.' + slot + ' нужны socks и http.')
+        numbers += [ports[slot][protocol] for protocol in LISTENERS]
+    if any(type(port) is not int or not 1024 <= port <= 65535 for port in numbers) or len(set(numbers)) != len(numbers):
+        raise ValueError('Порты туннелей должны быть разными числами от 1024 до 65535.')
+    SERVICE, CONFIG, XRAY, ROUTE_MARK = data['service'], config, str(xray), mark
+    BASELINE = CONFIG.with_name('widget-baseline.json')
+    for slot in SLOTS:
+        SLOTS[slot].update(ports[slot])
+
+
+def config_group():
+    # New files keep the group of the config Xray already reads, so the service user can still open them.
+    return CONFIG.stat().st_gid
+
+
+def main():
+    if os.geteuid() != 0 or not os.environ.get('PKEXEC_UID', '').isdecimal():
+        raise PermissionError('Требуется подтверждение администратора через pkexec.')
+    load_settings()
+    data = sys.stdin.buffer.read(65537)
+    if len(data) > 65536:
+        raise ValueError('Запрос слишком велик.')
+    request = json.loads(data)
+    if not isinstance(request, dict):
+        raise ValueError('Неизвестная команда.')
+    expected = {
+        'check': {'action', 'outbound'},
+        'check-many': {'action', 'profiles'},
+        'enable': {'action', 'slot', 'enabled'},
+        'select': {'action', 'slot', 'id'} if request.get('id') == 'original' else {'action', 'slot', 'id', 'outbound'},
+    }.get(request.get('action'))
+    if expected is None:
+        raise ValueError('Неизвестная команда.')
+    if set(request) != expected:
+        raise ValueError('Некорректный запрос профиля.')
+    fd = os.open(LOCK, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, 'w') as lock:
+        info = os.fstat(lock.fileno())
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:
+            raise ValueError('Недопустимые права файла блокировки.')
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if request['action'] == 'check':
+            check(request)
+            return {}
+        if request['action'] == 'check-many':
+            return check_many(request)
+        apply(request)
+        return {}
+
+
+def stop_signal(signum, frame):
+    raise KeyboardInterrupt()
+
+
+if __name__ == '__main__':
+    signal.signal(signal.SIGTERM, stop_signal)
+    try:
+        result = main()
+        print(json.dumps({'ok': True, **result}, ensure_ascii=False))
+    except (Exception, KeyboardInterrupt) as error:
+        if isinstance(error, (ValueError, RuntimeError, PermissionError)):
+            message = str(error)
+        else:
+            message = 'Не удалось переключить профиль. Проверьте системный журнал.'
+        print(json.dumps({'ok': False, 'error': message}, ensure_ascii=False))
+        sys.exit(1)

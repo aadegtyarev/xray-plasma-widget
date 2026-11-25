@@ -1,6 +1,5 @@
 import QtQuick 2.15
 import QtQuick.Layouts 1.15
-import QtQuick.Controls 2.15 as Controls
 import org.kde.plasma.core 2.0 as PlasmaCore
 import org.kde.plasma.plasmoid 2.0
 
@@ -9,28 +8,75 @@ Item {
     property bool running: false
     property bool known: false
     property bool busy: false
-    property string currentProfile: ""
+    property string pendingCommand: ""
+    property string queuedCommand: ""
     property string errorText: ""
-    property var profiles: []
+    property string warningText: ""
+    property var pings: ({})
+    property var primary: ({ selected: "", profiles: [] })
+    property var secondary: null
+    readonly property var pending: describe(pendingCommand)
+    readonly property var queued: describe(queuedCommand)
+    // Actions that change Xray and ask for the password; a ping or a status poll only reads.
+    readonly property bool acting: (busy && changes(pending)) || changes(queued)
+    readonly property string pingingSlot: busy && pending.kind === "ping" ? pending.slot : (queued.kind === "ping" ? queued.slot : "")
+
     readonly property string helper: '"$HOME/.local/bin/xray-widget" '
-    readonly property color stateColor: !known ? "#888888" : (running ? "#2eaf62" : "#d44848")
+    readonly property color stateColor: !known || acting ? "#888888" : (running ? "#2eaf62" : "#d44848")
+
+    function describe(command) {
+        const parts = command.split(" ")
+        if (parts[0] === "select") return { kind: "select", slot: "primary", id: parts[1] }
+        if (parts[0] === "select-secondary") return { kind: "select", slot: "secondary", id: parts[1] }
+        if (parts[0] === "enable") return { kind: "enable", slot: parts[1], id: "", on: parts[2] === "on" }
+        if (parts[0] === "ping") return { kind: "ping", slot: parts[1], id: "" }
+        if (parts[0] === "restart") return { kind: "restart", slot: "", id: "" }
+        return { kind: "", slot: "", id: "" }
+    }
+
+    function changes(action) {
+        return action.kind === "select" || action.kind === "enable" || action.kind === "restart"
+    }
 
     function execute(command) {
-        if (busy) return
+        if (busy) {
+            // A click during a background poll or ping must not be lost.
+            if (command !== "status" && !changes(pending)) queuedCommand = command
+            return
+        }
         busy = true
+        pendingCommand = command
+        if (command !== "status") errorText = ""
         runner.connectSource(helper + command)
+    }
+
+    function select(slot, profileId) {
+        if (/^[A-Za-z0-9_-]{1,80}$/.test(profileId))
+            execute((slot === "secondary" ? "select-secondary " : "select ") + profileId)
+    }
+
+    function setEnabled(slot, enabled) {
+        execute("enable " + slot + (enabled ? " on" : " off"))
+    }
+
+    function ping(slot) {
+        execute("ping " + slot)
+    }
+
+    function remember(result) {
+        const tunnel = result.slot === "secondary" ? secondary : primary
+        const next = Object.assign({}, pings)
+        next[result.slot] = { ok: result.ok, ms: result.ms || 0, ip: result.ip || "", country: result.country || "",
+                              at: Qt.formatTime(new Date(), "hh:mm"), profile: tunnel ? tunnel.selected : "" }
+        pings = next
     }
 
     function updateState(result) {
         root.running = result.running
-        root.currentProfile = result.selected
-        root.profiles = result.profiles
+        root.primary = { selected: result.selected, profiles: result.profiles, enabled: result.enabled, ports: result.ports }
+        root.secondary = result.secondary || null
+        root.warningText = result.warning || ""
         root.known = true
-        let index = -1
-        for (let i = 0; i < profiles.length; i++) {
-            if (profiles[i].id === currentProfile) index = i
-        }
-        selector.currentIndex = index
     }
 
     PlasmaCore.DataSource {
@@ -39,19 +85,31 @@ Item {
         connectedSources: []
         onNewData: {
             disconnectSource(sourceName)
+            const done = root.describe(root.pendingCommand)
             root.busy = false
+            root.pendingCommand = ""
+            let result = null
             try {
-                let result = JSON.parse(data.stdout)
-                if (result.ok) {
-                    root.updateState(result)
-                    if (sourceName !== root.helper + "status") root.errorText = ""
-                } else {
-                    root.known = false
-                    root.errorText = result.error || "Ошибка управления Xray"
-                }
+                result = JSON.parse(data.stdout)
             } catch (error) {
-                root.errorText = "Не удалось получить состояние Xray"
+                result = { ok: false, error: "Не удалось получить состояние Xray" }
+            }
+            if (result.ok) {
+                root.updateState(result)
+                if (result.ping) root.remember(result.ping)
+                // Check the link right after the tunnel got a new profile or was switched on.
+                if ((done.kind === "select" || (done.kind === "enable" && done.on)) && root.queuedCommand === "")
+                    root.queuedCommand = "ping " + done.slot
+            } else if (done.kind === "") {
                 root.known = false
+                root.errorText = result.error || "Ошибка управления Xray"
+            } else {
+                root.errorText = result.error || "Ошибка управления Xray"
+            }
+            if (root.queuedCommand !== "") {
+                const next = root.queuedCommand
+                root.queuedCommand = ""
+                root.execute(next)
             }
         }
     }
@@ -65,70 +123,24 @@ Item {
     }
 
     Plasmoid.toolTipMainText: "Прокси Xray"
-    Plasmoid.toolTipSubText: !known ? "Состояние неизвестно" : (running ? "Xray запущен" : "Xray остановлен")
+    Plasmoid.toolTipSubText: acting ? "Выполняется действие" : (!known ? "Состояние неизвестно" : (running ? "Xray запущен" : "Xray остановлен"))
 
     Plasmoid.compactRepresentation: Item {
-        implicitWidth: compactRow.implicitWidth + 12
-        implicitHeight: compactRow.implicitHeight + 8
-        RowLayout {
-            id: compactRow
+        implicitWidth: 24
+        implicitHeight: 24
+        Layout.minimumWidth: implicitWidth
+        Layout.preferredWidth: implicitWidth
+        Rectangle {
             anchors.centerIn: parent
-            spacing: 5
-            Rectangle { width: 9; height: 9; radius: 5; color: root.stateColor }
-            Controls.Label { text: "Xray" }
+            width: 12
+            height: 12
+            radius: 6
+            color: root.stateColor
         }
         MouseArea { anchors.fill: parent; onClicked: plasmoid.expanded = !plasmoid.expanded }
     }
 
-    Plasmoid.fullRepresentation: Item {
-        Layout.minimumWidth: 280
-        Layout.preferredWidth: 300
-        Layout.minimumHeight: content.implicitHeight + 20
-        ColumnLayout {
-            id: content
-            anchors.fill: parent
-            anchors.margins: 10
-            spacing: 8
-            RowLayout {
-                Rectangle { width: 10; height: 10; radius: 5; color: root.stateColor }
-                Controls.Label {
-                    text: !root.known ? "Состояние неизвестно" : (root.running ? "Xray запущен" : "Xray остановлен")
-                    Layout.fillWidth: true
-                }
-            }
-            Controls.Label {
-                text: "Состояние процесса, не проверка интернета"
-                font.pixelSize: 11
-                opacity: 0.75
-                wrapMode: Text.WordWrap
-                Layout.fillWidth: true
-            }
-            RowLayout {
-                Layout.fillWidth: true
-                Controls.ComboBox {
-                    id: selector
-                    Layout.fillWidth: true
-                    enabled: !root.busy && root.profiles.length > 0
-                    model: root.profiles
-                    textRole: "name"
-                    onActivated: {
-                        let id = root.profiles[index].id
-                        if (/^[A-Za-z0-9_-]{1,80}$/.test(id) && id !== root.currentProfile)
-                            root.execute("select " + id)
-                    }
-                }
-                Controls.Button {
-                    text: root.running ? "Перезапустить" : "Запустить"
-                    enabled: !root.busy
-                    onClicked: root.execute("restart")
-                }
-            }
-            Controls.Label {
-                visible: root.errorText !== ""
-                text: root.errorText
-                wrapMode: Text.WordWrap
-                Layout.fillWidth: true
-            }
-        }
+    Plasmoid.fullRepresentation: FullRepresentation {
+        applet: root
     }
 }

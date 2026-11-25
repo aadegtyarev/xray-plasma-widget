@@ -1,0 +1,28 @@
+{
+  "log": { "loglevel": "warning" },
+  "inbounds": [
+    {
+      "tag": "socks", "listen": "127.0.0.1", "port": 10808, "protocol": "socks",
+      "settings": { "auth": "noauth", "udp": true },
+      "sniffing": { "enabled": true, "destOverride": ["http", "tls"], "routeOnly": true }
+    },
+    { "tag": "http", "listen": "127.0.0.1", "port": 10809, "protocol": "http", "settings": {} }
+  ],
+  "outbounds": [
+    {
+      "tag": "proxy-primary", "protocol": "vless",
+      "settings": { "vnext": [{ "address": "vpn.example.com", "port": 443,
+        "users": [{ "id": "00000000-0000-4000-8000-000000000001", "encryption": "none", "flow": "xtls-rprx-vision" }] }] },
+      "streamSettings": { "network": "tcp", "security": "reality",
+        "realitySettings": { "serverName": "www.example.org", "fingerprint": "chrome", "password": "PUBLIC-KEY", "shortId": "ab12" } }
+    },
+    { "tag": "direct", "protocol": "freedom" }
+  ],
+  "routing": {
+    "domainStrategy": "AsIs",
+    "rules": [
+      { "type": "field", "ip": ["127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "::1/128", "fc00::/7"], "outboundTag": "direct" },
+      { "type": "field", "network": "tcp,udp", "outboundTag": "proxy-primary" }
+    ]
+  }
+}
